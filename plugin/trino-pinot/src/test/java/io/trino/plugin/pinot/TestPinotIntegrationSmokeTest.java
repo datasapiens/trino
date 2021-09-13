@@ -738,7 +738,7 @@ public class TestPinotIntegrationSmokeTest
                         "  FROM " + ALL_TYPES_TABLE +
                         "  WHERE bytes_col = X'' AND string_col = 'null'"))
                 .matches("VALUES (VARCHAR 'null')")
-                .isNotFullyPushedDown(ExchangeNode.class, ProjectNode.class, FilterNode.class);
+                .isNotFullyPushedDown(ExchangeNode.class, ProjectNode.class);
 
         // Default null value for booleans is the string 'null'
         // Booleans are treated as a string

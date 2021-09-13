@@ -32,12 +32,12 @@ public final class DynamicTable
 
     private final Optional<String> suffix;
 
-    private final List<String> selections;
+    private final List<PinotExpression> selections;
 
     private final Optional<String> filter;
 
     // semantically aggregation is applied after constraint
-    private final List<String> groupingColumns;
+    private final List<PinotExpression> groupingColumns;
     private final List<PinotColumnHandle> aggregateColumns;
 
     // semantically sorting is applied after aggregation
@@ -49,13 +49,15 @@ public final class DynamicTable
 
     private final String query;
 
+    private final boolean isAggregateInSelectList;
+
     @JsonCreator
     public DynamicTable(
             @JsonProperty("tableName") String tableName,
             @JsonProperty("suffix") Optional<String> suffix,
-            @JsonProperty("selections") List<String> selections,
+            @JsonProperty("selections") List<PinotExpression> selections,
             @JsonProperty("filter") Optional<String> filter,
-            @JsonProperty("groupingColumns") List<String> groupingColumns,
+            @JsonProperty("groupingColumns") List<PinotExpression> groupingColumns,
             @JsonProperty("aggregateColumns") List<PinotColumnHandle> aggregateColumns,
             @JsonProperty("orderBy") List<OrderByExpression> orderBy,
             @JsonProperty("limit") OptionalLong limit,
@@ -72,6 +74,8 @@ public final class DynamicTable
         this.limit = requireNonNull(limit, "limit is null");
         this.offset = requireNonNull(offset, "offset is null");
         this.query = requireNonNull(query, "query is null");
+        this.isAggregateInSelectList = selections.stream()
+                .anyMatch(PinotExpression::isAggregate);
     }
 
     @JsonProperty
@@ -87,7 +91,7 @@ public final class DynamicTable
     }
 
     @JsonProperty
-    public List<String> getSelections()
+    public List<PinotExpression> getSelections()
     {
         return selections;
     }
@@ -99,7 +103,7 @@ public final class DynamicTable
     }
 
     @JsonProperty
-    public List<String> getGroupingColumns()
+    public List<PinotExpression> getGroupingColumns()
     {
         return groupingColumns;
     }
@@ -132,6 +136,11 @@ public final class DynamicTable
     public String getQuery()
     {
         return query;
+    }
+
+    public boolean isAggregateInSelectList()
+    {
+        return isAggregateInSelectList;
     }
 
     @Override

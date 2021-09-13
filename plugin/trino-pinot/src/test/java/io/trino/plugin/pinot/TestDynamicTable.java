@@ -18,6 +18,7 @@ import com.google.common.collect.ImmutableMap;
 import io.airlift.slice.Slices;
 import io.trino.plugin.pinot.query.DynamicTable;
 import io.trino.plugin.pinot.query.OrderByExpression;
+import io.trino.plugin.pinot.query.PinotExpression;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.predicate.Domain;
@@ -28,11 +29,11 @@ import org.testng.annotations.Test;
 
 import java.util.List;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.plugin.pinot.query.DynamicTableBuilder.OFFLINE_SUFFIX;
 import static io.trino.plugin.pinot.query.DynamicTableBuilder.REALTIME_SUFFIX;
 import static io.trino.plugin.pinot.query.DynamicTableBuilder.buildFromPql;
 import static io.trino.plugin.pinot.query.DynamicTablePqlExtractor.extractPql;
-import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.VarcharType.VARCHAR;
 import static java.lang.String.format;
 import static java.util.Locale.ENGLISH;
@@ -62,7 +63,10 @@ public class TestDynamicTable
                         .collect(joining(", ")) + " desc",
                 limit);
         DynamicTable dynamicTable = buildFromPql(pinotMetadata, new SchemaTableName("default", query));
-        assertEquals(dynamicTable.getSelections(), columnNames);
+        assertEquals(dynamicTable.getSelections().stream()
+                .map(PinotExpression::getColumnName)
+                .collect(toImmutableList()),
+                columnNames);
         orderByExpressions.add(new OrderByExpression(orderByColumns.get(4), false));
         assertEquals(dynamicTable.getOrderBy(), orderByExpressions);
         assertEquals(dynamicTable.getLimit().getAsLong(), limit);
@@ -75,14 +79,13 @@ public class TestDynamicTable
         long limit = 25;
         String query = format("SELECT Origin, AirlineID, max(CarrierDelay), avg(CarrierDelay) FROM %s GROUP BY Origin, AirlineID LIMIT %s", tableName, limit);
         DynamicTable dynamicTable = buildFromPql(pinotMetadata, new SchemaTableName("default", query));
-        assertEquals(dynamicTable.getGroupingColumns(), ImmutableList.builder()
-                .add("Origin")
-                .add("AirlineID")
-                .build());
-        assertEquals(dynamicTable.getAggregateColumns(), ImmutableList.builder()
-                .add(new PinotColumnHandle("max(carrierdelay)", DOUBLE))
-                .add(new PinotColumnHandle("avg(carrierdelay)", DOUBLE))
-                .build());
+        assertEquals(dynamicTable.getGroupingColumns().stream()
+                        .map(PinotExpression::getColumnName)
+                        .collect(toImmutableList()),
+                ImmutableList.builder()
+                        .add("Origin")
+                        .add("AirlineID")
+                        .build());
         assertEquals(dynamicTable.getLimit().getAsLong(), limit);
     }
 
@@ -220,6 +223,51 @@ public class TestDynamicTable
         String query = format("select * from %s limit 70", tableNameWithSuffix);
         DynamicTable dynamicTable = buildFromPql(pinotMetadata, new SchemaTableName("default", query));
         String expectedPql = format("select %s from %s limit 70", getColumnNames(tableName).stream().collect(joining(", ")), tableNameWithSuffix);
+        assertEquals(extractPql(dynamicTable, TupleDomain.all(), ImmutableList.of()), expectedPql);
+        assertEquals(dynamicTable.getTableName(), tableName);
+    }
+
+    @Test
+    public void testSelectExpressionsWithAliases()
+    {
+        String tableName = hybridTable.getTableName();
+        String tableNameWithSuffix = tableName + REALTIME_SUFFIX;
+        String query = format("select datetimeconvert(dayssinceEpoch, '1:seconds:epoch', '1:milliseconds:epoch', '15:minutes'), " +
+                "case origincityname when 'nyc' then 'pizza' when 'la' then 'burrito' when 'boston' then 'clam chowder'" +
+                " else 'burger' end != 'salad'," +
+                " timeconvert(dayssinceEpoch, 'seconds', 'minutes') as foo" +
+                " from %s  limit 70", tableNameWithSuffix);
+
+        DynamicTable dynamicTable = buildFromPql(pinotMetadata, new SchemaTableName("default", query));
+        String expectedPql = format("select datetimeconvert(DaysSinceEpoch, '1:SECONDS:EPOCH', '1:MILLISECONDS:EPOCH', '15:MINUTES')," +
+                " not_equals(CASE WHEN equals(OriginCityName, 'nyc') THEN 'pizza' WHEN equals(OriginCityName, 'la') THEN 'burrito' WHEN equals(OriginCityName, 'boston') THEN 'clam chowder' ELSE 'burger' END, 'salad')," +
+                " timeconvert(DaysSinceEpoch, 'SECONDS', 'MINUTES') AS foo from %s limit 70", tableNameWithSuffix);
+        assertEquals(extractPql(dynamicTable, TupleDomain.all(), ImmutableList.of()), expectedPql);
+        assertEquals(dynamicTable.getTableName(), tableName);
+    }
+
+    @Test
+    public void testAggregateExpressionsWithAliases()
+    {
+        String tableName = hybridTable.getTableName();
+        String tableNameWithSuffix = tableName + REALTIME_SUFFIX;
+        String query = format("select datetimeconvert(dayssinceEpoch, '1:seconds:epoch', '1:milliseconds:epoch', '15:minutes'), " +
+                " count(*) as bar," +
+                " case origincityname when 'nyc' then 'pizza' when 'la' then 'burrito' when 'boston' then 'clam chowder'" +
+                " else 'burger' end != 'salad'," +
+                " timeconvert(dayssinceEpoch, 'seconds', 'minutes') as foo," +
+                " max(airtime) as baz" +
+                " from %s  group by 1, 3, 4 limit 70", tableNameWithSuffix);
+
+        DynamicTable dynamicTable = buildFromPql(pinotMetadata, new SchemaTableName("default", query));
+        String expectedPql = format("select datetimeconvert(DaysSinceEpoch, '1:SECONDS:EPOCH', '1:MILLISECONDS:EPOCH', '15:MINUTES')," +
+                " count(*) AS bar," +
+                " not_equals(CASE WHEN equals(OriginCityName, 'nyc') THEN 'pizza' WHEN equals(OriginCityName, 'la') THEN 'burrito' WHEN equals(OriginCityName, 'boston') THEN 'clam chowder' ELSE 'burger' END, 'salad')," +
+                " timeconvert(DaysSinceEpoch, 'SECONDS', 'MINUTES') AS foo," +
+                " max(AirTime) AS baz from %s" +
+                " group by datetimeconvert(DaysSinceEpoch, '1:SECONDS:EPOCH', '1:MILLISECONDS:EPOCH', '15:MINUTES')," +
+                " not_equals(CASE WHEN equals(OriginCityName, 'nyc') THEN 'pizza' WHEN equals(OriginCityName, 'la') THEN 'burrito' WHEN equals(OriginCityName, 'boston') THEN 'clam chowder' ELSE 'burger' END, 'salad')," +
+                " timeconvert(DaysSinceEpoch, 'SECONDS', 'MINUTES') limit 70", tableNameWithSuffix);
         assertEquals(extractPql(dynamicTable, TupleDomain.all(), ImmutableList.of()), expectedPql);
         assertEquals(dynamicTable.getTableName(), tableName);
     }

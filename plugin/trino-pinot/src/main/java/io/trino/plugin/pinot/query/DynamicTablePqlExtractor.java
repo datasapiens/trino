@@ -37,18 +37,19 @@ public final class DynamicTablePqlExtractor
         builder.append("select ");
         if (!table.getSelections().isEmpty()) {
             builder.append(table.getSelections().stream()
+                    .map(DynamicTablePqlExtractor::formatPinotExpression)
                     .collect(joining(", ")));
         }
-        if (!table.getGroupingColumns().isEmpty()) {
-            builder.append(table.getGroupingColumns().stream()
-                    .collect(joining(", ")));
-            if (!table.getAggregateColumns().isEmpty()) {
+
+        if (!table.getAggregateColumns().isEmpty()) {
+            // If there are only pushed down aggregate expressions
+            if (!table.getSelections().isEmpty()) {
                 builder.append(", ");
             }
+            builder.append(table.getAggregateColumns().stream()
+                    .map(PinotColumnHandle::getColumnName)
+                    .collect(joining(", ")));
         }
-        builder.append(table.getAggregateColumns().stream()
-                .map(PinotColumnHandle::getColumnName)
-                .collect(joining(", ")));
         builder.append(" from ");
         builder.append(table.getTableName());
         builder.append(table.getSuffix().orElse(""));
@@ -61,6 +62,7 @@ public final class DynamicTablePqlExtractor
         if (!table.getGroupingColumns().isEmpty()) {
             builder.append(" group by ");
             builder.append(table.getGroupingColumns().stream()
+                    .map(PinotExpression::getExpression)
                     .collect(joining(", ")));
         }
         if (!table.getOrderBy().isEmpty()) {
@@ -112,5 +114,13 @@ public final class DynamicTablePqlExtractor
     public static String encloseInParentheses(String value)
     {
         return format("(%s)", value);
+    }
+
+    private static String formatPinotExpression(PinotExpression expression)
+    {
+        if (expression.getAlias().isPresent()) {
+            return expression.getExpression() + " AS " + expression.getAlias().get();
+        }
+        return expression.getExpression();
     }
 }

@@ -24,6 +24,7 @@ import io.trino.spi.type.RealType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.VarbinaryType;
 import io.trino.spi.type.VarcharType;
+import org.apache.pinot.core.operator.transform.TransformResultMetadata;
 import org.apache.pinot.spi.data.FieldSpec;
 import org.apache.pinot.spi.data.FieldSpec.DataType;
 import org.apache.pinot.spi.data.Schema;
@@ -103,6 +104,17 @@ public class PinotColumn
     {
         Type type = getTrinoTypeFromPinotType(field.getDataType());
         if (field.isSingleValueField()) {
+            return type;
+        }
+        else {
+            return new ArrayType(type);
+        }
+    }
+
+    public static Type getTrinoTypeFromPinotType(TransformResultMetadata transformResultMetadata)
+    {
+        Type type = getTrinoTypeFromPinotType(transformResultMetadata.getDataType());
+        if (transformResultMetadata.isSingleValue()) {
             return type;
         }
         else {
