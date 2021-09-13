@@ -18,7 +18,6 @@ import io.trino.spi.block.BlockBuilder;
 import java.util.function.Supplier;
 
 import static io.trino.spi.type.BooleanType.BOOLEAN;
-import static java.lang.Boolean.parseBoolean;
 
 public class BooleanDecoder
         implements Decoder
@@ -31,7 +30,7 @@ public class BooleanDecoder
             output.appendNull();
         }
         else {
-            BOOLEAN.writeBoolean(output, parseBoolean(value.toString()));
+            BOOLEAN.writeBoolean(output, (boolean) value);
         }
     }
 }

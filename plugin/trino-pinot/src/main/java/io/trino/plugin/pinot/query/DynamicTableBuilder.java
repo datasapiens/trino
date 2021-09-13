@@ -23,7 +23,10 @@ import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.Type;
 import org.apache.pinot.common.request.BrokerRequest;
-import org.apache.pinot.common.request.SelectionSort;
+import org.apache.pinot.common.request.PinotQuery;
+import org.apache.pinot.common.request.context.ExpressionContext;
+import org.apache.pinot.common.request.context.FunctionContext;
+import org.apache.pinot.common.request.context.OrderByExpressionContext;
 import org.apache.pinot.common.utils.DataSchema;
 import org.apache.pinot.core.query.aggregation.function.AggregationFunction;
 import org.apache.pinot.core.query.request.context.QueryContext;
@@ -35,9 +38,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 
+import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.plugin.pinot.PinotErrorCode.PINOT_UNSUPPORTED_COLUMN_TYPE;
-import static io.trino.plugin.pinot.query.FilterToPinotSqlConverter.convertFilter;
+import static io.trino.plugin.pinot.query.PinotSqlFormatter.formatFilter;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.IntegerType.INTEGER;
@@ -64,45 +68,45 @@ public final class DynamicTableBuilder
         requireNonNull(schemaTableName, "schemaTableName is null");
         String query = schemaTableName.getTableName();
         BrokerRequest request = REQUEST_COMPILER.compileToBrokerRequest(query);
+        PinotQuery pinotQuery = request.getPinotQuery();
+        QueryContext queryContext = BrokerRequestToQueryContextConverter.convert(request);
         String pinotTableName = stripSuffix(request.getQuerySource().getTableName());
         Optional<String> suffix = getSuffix(request.getQuerySource().getTableName());
 
         Map<String, ColumnHandle> columnHandles = pinotMetadata.getPinotColumnHandles(pinotTableName);
         List<String> selectionColumns = ImmutableList.of();
         List<OrderByExpression> orderBy = ImmutableList.of();
-        if (request.getSelections() != null) {
-            selectionColumns = resolvePinotColumns(schemaTableName, request.getSelections().getSelectionColumns(), columnHandles);
-            if (request.getSelections().getSelectionSortSequence() != null) {
-                ImmutableList.Builder<OrderByExpression> orderByBuilder = ImmutableList.builder();
-                for (SelectionSort sortItem : request.getSelections().getSelectionSortSequence()) {
-                    PinotColumnHandle columnHandle = (PinotColumnHandle) columnHandles.get(sortItem.getColumn());
-                    if (columnHandle == null) {
-                        throw new ColumnNotFoundException(schemaTableName, sortItem.getColumn());
-                    }
-                    orderByBuilder.add(new OrderByExpression(columnHandle.getColumnName(), sortItem.isIsAsc()));
-                }
-                orderBy = orderByBuilder.build();
+        if (queryContext.getSelectExpressions() != null && queryContext.getAggregationFunctions() == null) {
+            checkState(queryContext.getSelectExpressions() != null && !queryContext.getSelectExpressions().isEmpty(), "Pinot selections is null or empty");
+            checkState(queryContext.getAliasList() == null || queryContext.getAliasList().isEmpty() || !queryContext.getAliasList().stream().anyMatch(alias -> alias != null), "Aliases are not supported");
+            selectionColumns = getPinotColumnNames(schemaTableName, queryContext.getSelectExpressions(), columnHandles);
+        }
+
+        if (queryContext.getOrderByExpressions() != null) {
+            ImmutableList.Builder<OrderByExpression> orderByBuilder = ImmutableList.builder();
+            for (OrderByExpressionContext orderByExpressionContext : queryContext.getOrderByExpressions()) {
+                ExpressionContext expressionContext = orderByExpressionContext.getExpression();
+                checkState(expressionContext.getType() == ExpressionContext.Type.IDENTIFIER, "Unexpected order by expression: '%s'", expressionContext);
+                PinotColumnHandle columnHandle = getColumnHandle(schemaTableName, expressionContext.getIdentifier(), columnHandles);
+                orderByBuilder.add(new OrderByExpression(columnHandle.getColumnName(), orderByExpressionContext.isAsc()));
             }
+            orderBy = orderByBuilder.build();
         }
 
-        List<String> groupByColumns;
-        if (request.getGroupBy() == null) {
-            groupByColumns = ImmutableList.of();
-        }
-        else {
-            groupByColumns = resolvePinotColumns(schemaTableName, request.getGroupBy().getExpressions(), columnHandles);
+        List<String> groupByColumns = ImmutableList.of();
+        if (queryContext.getGroupByExpressions() != null) {
+            groupByColumns = getPinotColumnNames(schemaTableName, queryContext.getGroupByExpressions(), columnHandles);
         }
 
-        Optional<String> filter;
-        if (request.getFilterQuery() != null) {
-            filter = Optional.of(convertFilter(request.getPinotQuery(), columnHandles));
+        Optional<String> filter = Optional.empty();
+        if (pinotQuery.getFilterExpression() != null) {
+            String formatted = formatFilter(schemaTableName, queryContext.getFilter(), columnHandles);
+            filter = Optional.of(formatted);
         }
-        else {
-            filter = Optional.empty();
-        }
-        QueryContext queryContext = BrokerRequestToQueryContextConverter.convert(request);
+
         ImmutableList.Builder<PinotColumnHandle> aggregateColumnsBuilder = ImmutableList.builder();
-        if (request.getAggregationsInfo() != null) {
+        if (queryContext.getAggregationFunctions() != null) {
+            checkState(queryContext.getAggregationFunctions().length > 0, "Aggregation Functions is empty");
             for (AggregationFunction aggregationFunction : queryContext.getAggregationFunctions()) {
                 aggregateColumnsBuilder.add(new PinotColumnHandle(
                         aggregationFunction.getResultColumnName(),
@@ -110,7 +114,16 @@ public final class DynamicTableBuilder
             }
         }
 
-        return new DynamicTable(pinotTableName, suffix, selectionColumns, filter, groupByColumns, aggregateColumnsBuilder.build(), orderBy, getTopNOrLimit(request), getOffset(request), query);
+        return new DynamicTable(pinotTableName, suffix, selectionColumns, filter, groupByColumns, aggregateColumnsBuilder.build(), orderBy, OptionalLong.of(queryContext.getLimit()), getOffset(queryContext), query);
+    }
+
+    private static PinotColumnHandle getColumnHandle(SchemaTableName schemaTableName, String name, Map<String, ColumnHandle> columnHandles)
+    {
+        PinotColumnHandle columnHandle = (PinotColumnHandle) columnHandles.get(name);
+        if (columnHandle == null) {
+            throw new ColumnNotFoundException(schemaTableName, name);
+        }
+        return columnHandle;
     }
 
     private static Type toTrinoType(DataSchema.ColumnDataType columnDataType)
@@ -142,41 +155,55 @@ public final class DynamicTableBuilder
         throw new PinotException(PINOT_UNSUPPORTED_COLUMN_TYPE, Optional.empty(), "Unsupported column data type: " + columnDataType);
     }
 
-    private static List<String> resolvePinotColumns(SchemaTableName schemaTableName, List<String> trinoColumnNames, Map<String, ColumnHandle> columnHandles)
+    private static List<String> getPinotColumnNames(SchemaTableName schemaTableName, List<ExpressionContext> expressions, Map<String, ColumnHandle> columnHandles)
     {
         ImmutableList.Builder<String> pinotColumnNamesBuilder = ImmutableList.builder();
-        for (String trinoColumnName : trinoColumnNames) {
-            if (trinoColumnName.equals(WILDCARD)) {
-                pinotColumnNamesBuilder.addAll(columnHandles.values().stream().map(handle -> ((PinotColumnHandle) handle).getColumnName()).collect(toImmutableList()));
-            }
-            else {
-                PinotColumnHandle columnHandle = (PinotColumnHandle) columnHandles.get(trinoColumnName);
-                if (columnHandle == null) {
-                    throw new ColumnNotFoundException(schemaTableName, trinoColumnName);
-                }
-                pinotColumnNamesBuilder.add(columnHandle.getColumnName());
+        for (ExpressionContext expressionContext : expressions) {
+            switch (expressionContext.getType()) {
+                case LITERAL:
+                    pinotColumnNamesBuilder.add(expressionContext.getLiteral());
+                    break;
+                case IDENTIFIER:
+                    if (expressionContext.getIdentifier().equals(WILDCARD)) {
+                        pinotColumnNamesBuilder.addAll(columnHandles.values().stream().map(handle -> ((PinotColumnHandle) handle).getColumnName()).collect(toImmutableList()));
+                    }
+                    else {
+                        pinotColumnNamesBuilder.add(getColumnHandle(schemaTableName, expressionContext.getIdentifier(), columnHandles).getColumnName());
+                    }
+                    break;
+                case FUNCTION:
+                    ExpressionContext rewrittenContext = rewriteExpressionContext(schemaTableName, expressionContext, columnHandles);
+                    pinotColumnNamesBuilder.add(rewrittenContext.getFunction().toString());
+                    break;
+                default:
+                    throw new PinotException(PINOT_UNSUPPORTED_COLUMN_TYPE, Optional.empty(), "Unsupported pinot expression type: " + expressionContext.getType());
             }
         }
         return pinotColumnNamesBuilder.build();
     }
 
-    private static OptionalLong getTopNOrLimit(BrokerRequest request)
+    private static ExpressionContext rewriteExpressionContext(SchemaTableName schemaTableName, ExpressionContext expressionContext, Map<String, ColumnHandle> columnHandles)
     {
-        if (request.getGroupBy() != null) {
-            return OptionalLong.of(request.getGroupBy().getTopN());
-        }
-        else if (request.getSelections() != null) {
-            return OptionalLong.of(request.getSelections().getSize());
-        }
-        else {
-            return OptionalLong.empty();
+        switch (expressionContext.getType()) {
+            case LITERAL:
+                return expressionContext;
+            case IDENTIFIER:
+                String pinotColumnName = getColumnHandle(schemaTableName, expressionContext.getIdentifier(), columnHandles).getColumnName();
+                return ExpressionContext.forIdentifier(pinotColumnName);
+            case FUNCTION:
+                List<ExpressionContext> arguments = expressionContext.getFunction().getArguments().stream()
+                        .map(context -> rewriteExpressionContext(schemaTableName, context, columnHandles))
+                        .collect(toImmutableList());
+                return ExpressionContext.forFunction(new FunctionContext(expressionContext.getFunction().getType(), expressionContext.getFunction().getFunctionName(), arguments));
+            default:
+                throw new PinotException(PINOT_UNSUPPORTED_COLUMN_TYPE, Optional.empty(), "Unsupported pinot expression type: " + expressionContext.getType());
         }
     }
 
-    private static OptionalLong getOffset(BrokerRequest request)
+    private static OptionalLong getOffset(QueryContext queryContext)
     {
-        if (request.getSelections() != null && request.getSelections().getOffset() > 0) {
-            return OptionalLong.of(request.getSelections().getOffset());
+        if (queryContext.getOffset() > 0) {
+            return OptionalLong.of(queryContext.getOffset());
         }
         else {
             return OptionalLong.empty();

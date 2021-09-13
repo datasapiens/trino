@@ -100,8 +100,8 @@ public class TestPinotIntegrationSmokeTest
             allTypesRecordsBuilder.add(new ProducerRecord<>(ALL_TYPES_TABLE, "key" + i * step,
                     createTestRecord(
                             Arrays.asList("string_" + (offset), "string1_" + (offset + 1), "string2_" + (offset + 2)),
-                            Arrays.asList(false, true, true),
-                            Arrays.asList(54, -10001, 1000),
+                            true,
+                            Arrays.asList(54 + i / 3, -10001, 1000),
                             Arrays.asList(-7.33F + i, Float.POSITIVE_INFINITY, 17.034F + i),
                             Arrays.asList(-17.33D + i, Double.POSITIVE_INFINITY, 10596.034D + i),
                             Arrays.asList(-3147483647L + i, 12L - i, 4147483647L + i),
@@ -258,7 +258,7 @@ public class TestPinotIntegrationSmokeTest
 
     private static GenericRecord createTestRecord(
             List<String> stringArrayColumn,
-            List<Boolean> booleanArrayColumn,
+            Boolean booleanColumn,
             List<Integer> intArrayColumn,
             List<Float> floatArrayColumn,
             List<Double> doubleArrayColumn,
@@ -269,10 +269,9 @@ public class TestPinotIntegrationSmokeTest
 
         return new GenericRecordBuilder(schema)
                 .set("string_col", stringArrayColumn.get(0))
-                .set("bool_col", booleanArrayColumn.get(0))
+                .set("bool_col", booleanColumn)
                 .set("bytes_col", Hex.toHexString(stringArrayColumn.get(0).getBytes(StandardCharsets.UTF_8)))
                 .set("string_array_col", stringArrayColumn)
-                .set("bool_array_col", booleanArrayColumn)
                 .set("int_array_col", intArrayColumn)
                 .set("int_array_col_with_pinot_default", intArrayColumn)
                 .set("float_array_col", floatArrayColumn)
@@ -299,7 +298,6 @@ public class TestPinotIntegrationSmokeTest
     {
         Schema schema = getAllTypesAvroSchema();
         List<String> stringList = Arrays.asList("string_0", null, "string_2", null, "string_4");
-        List<Boolean> booleanList = Arrays.asList(true, null, false, null, true);
         List<Integer> integerList = new ArrayList<>();
         integerList.addAll(Arrays.asList(null, null, null, null, null));
         List<Integer> integerWithDefaultList = Arrays.asList(-1112, null, 753, null, -9238);
@@ -311,7 +309,6 @@ public class TestPinotIntegrationSmokeTest
         return new GenericRecordBuilder(schema)
                 .set("string_col", "array_null")
                 .set("string_array_col", stringList)
-                .set("bool_array_col", booleanList)
                 .set("int_array_col", integerList)
                 .set("int_array_col_with_pinot_default", integerWithDefaultList)
                 .set("float_array_col", floatList)
@@ -337,7 +334,6 @@ public class TestPinotIntegrationSmokeTest
                 .name("bool_col").type().optional().booleanType()
                 .name("bytes_col").type().optional().stringType()
                 .name("string_array_col").type().optional().array().items().nullable().stringType()
-                .name("bool_array_col").type().optional().array().items().nullable().booleanType()
                 .name("int_array_col").type().optional().array().items().nullable().intType()
                 .name("int_array_col_with_pinot_default").type().optional().array().items().nullable().intType()
                 .name("float_array_col").type().optional().array().items().nullable().floatType()
@@ -645,8 +641,8 @@ public class TestPinotIntegrationSmokeTest
                 "Broker query returned '13' rows, maximum allowed is '12' rows. with query \"select updated_at_seconds, string_col from too_many_broker_rows limit 13\"");
 
         // Pinot issue preventing Integer.MAX_VALUE from being a limit: https://github.com/apache/incubator-pinot/issues/7110
-        assertQueryFails("SELECT * FROM \"SELECT string_col, long_col FROM " + ALL_TYPES_TABLE + " LIMIT " + Integer.MAX_VALUE + "\"",
-                "Unexpected response status: 500 for request \\{\"sql\" : \"select string_col, long_col from alltypes limit 2147483647\" \\} to url http://localhost:\\d+/query/sql, with headers \\{Accept=\\[application/json\\], Content-Type=\\[application/json\\]\\}, full response null");
+        // This is now resolved in pinot 0.8.0
+        assertQuerySucceeds("SELECT * FROM \"SELECT string_col, long_col FROM " + ALL_TYPES_TABLE + " LIMIT " + Integer.MAX_VALUE + "\"");
 
         // Pinot broker requests do not handle limits greater than Integer.MAX_VALUE
         // Note that -2147483648 is due to an integer overflow in Pinot: https://github.com/apache/pinot/issues/7242
@@ -733,14 +729,14 @@ public class TestPinotIntegrationSmokeTest
         // Default null value for strings is the string 'null'
         assertThat(query("SELECT string_col" +
                         "  FROM " + ALL_TYPES_TABLE +
-                        "  WHERE bytes_col = X'' AND element_at(bool_array_col, 1) = 'null'"))
+                        "  WHERE bytes_col = X'' AND element_at(string_array_col, 1) = 'null'"))
                 .matches("VALUES (VARCHAR 'null')")
                 .isNotFullyPushedDown(FilterNode.class);
 
         // Default array null value for strings is the string 'null'
         assertThat(query("SELECT element_at(string_array_col, 1)" +
                         "  FROM " + ALL_TYPES_TABLE +
-                        "  WHERE bytes_col = X'' AND element_at(bool_array_col, 1) = 'null'"))
+                        "  WHERE bytes_col = X'' AND string_col = 'null'"))
                 .matches("VALUES (VARCHAR 'null')")
                 .isNotFullyPushedDown(ExchangeNode.class, ProjectNode.class, FilterNode.class);
 
@@ -749,16 +745,8 @@ public class TestPinotIntegrationSmokeTest
         assertThat(query("SELECT bool_col" +
                         "  FROM " + ALL_TYPES_TABLE +
                         "  WHERE string_col = 'null'"))
-                .matches("VALUES (VARCHAR 'null')")
+                .matches("VALUES (false)")
                 .isFullyPushedDown();
-
-        // Default array null value for booleans is the string 'null'
-        // Boolean are treated as a string
-        assertThat(query("SELECT element_at(bool_array_col, 1)" +
-                        "  FROM " + ALL_TYPES_TABLE +
-                        "  WHERE string_col = 'null'"))
-                .matches("VALUES (VARCHAR 'null')")
-                .isNotFullyPushedDown(ProjectNode.class);
 
         // Default null value for pinot BYTES type (varbinary) is the string 'null'
         // BYTES values are treated as a strings
@@ -801,7 +789,6 @@ public class TestPinotIntegrationSmokeTest
         // Default value for a "null" array is 1 element with default null array value,
         // Values are tested above, this test is to verify pinot returns an array with 1 element.
         assertThat(query("SELECT CARDINALITY(string_array_col)," +
-                        "  CARDINALITY(bool_array_col)," +
                         "  CARDINALITY(int_array_col_with_pinot_default)," +
                         "  CARDINALITY(int_array_col)," +
                         "  CARDINALITY(float_array_col)," +
@@ -809,13 +796,12 @@ public class TestPinotIntegrationSmokeTest
                         "  CARDINALITY(long_array_col)" +
                         "  FROM " + ALL_TYPES_TABLE +
                         "  WHERE string_col = 'null'"))
-                .matches("VALUES (BIGINT '1', BIGINT '1', BIGINT '1', BIGINT '1', BIGINT '1', BIGINT '1', BIGINT '1')")
+                .matches("VALUES (BIGINT '1', BIGINT '1', BIGINT '1', BIGINT '1', BIGINT '1', BIGINT '1')")
                 .isNotFullyPushedDown(ProjectNode.class);
 
         // If an array contains both null and non-null values, the null values are omitted:
         // There are 5 values in the avro records, but only the 3 non-null values are in pinot
         assertThat(query("SELECT CARDINALITY(string_array_col)," +
-                        "  CARDINALITY(bool_array_col)," +
                         "  CARDINALITY(int_array_col_with_pinot_default)," +
                         "  CARDINALITY(int_array_col)," +
                         "  CARDINALITY(float_array_col)," +
@@ -823,7 +809,7 @@ public class TestPinotIntegrationSmokeTest
                         "  CARDINALITY(long_array_col)" +
                         "  FROM " + ALL_TYPES_TABLE +
                         "  WHERE string_col = 'array_null'"))
-                .matches("VALUES (BIGINT '3', BIGINT '3', BIGINT '3', BIGINT '1', BIGINT '1', BIGINT '1', BIGINT '1')")
+                .matches("VALUES (BIGINT '3', BIGINT '3', BIGINT '1', BIGINT '1', BIGINT '1', BIGINT '1')")
                 .isNotFullyPushedDown(ProjectNode.class);
     }
 
@@ -880,9 +866,9 @@ public class TestPinotIntegrationSmokeTest
     public void testLimitPushdown()
     {
         assertThat(query("SELECT string_col, long_col FROM " + "\"SELECT string_col, long_col, bool_col FROM " + ALL_TYPES_TABLE + " WHERE int_col > 0\" " +
-                "  WHERE bool_col = 'false' LIMIT " + MAX_ROWS_PER_SPLIT_FOR_SEGMENT_QUERIES))
+                "  WHERE bool_col = false LIMIT " + MAX_ROWS_PER_SPLIT_FOR_SEGMENT_QUERIES))
                 .isFullyPushedDown();
-        assertThat(query("SELECT string_col, long_col FROM " + ALL_TYPES_TABLE + "  WHERE int_col >0 AND bool_col = 'false' LIMIT " + MAX_ROWS_PER_SPLIT_FOR_SEGMENT_QUERIES))
+        assertThat(query("SELECT string_col, long_col FROM " + ALL_TYPES_TABLE + "  WHERE int_col >0 AND bool_col = false LIMIT " + MAX_ROWS_PER_SPLIT_FOR_SEGMENT_QUERIES))
                 .isNotFullyPushedDown(LimitNode.class);
     }
 
